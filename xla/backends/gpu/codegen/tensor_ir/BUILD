@@ -55,3 +55,56 @@ cc_library(
         "@com_google_absl//absl/strings",
     ],
 )
+
+cc_library(
+    name = "compilation_pipeline",
+    srcs = ["compilation_pipeline.cc"],
+    hdrs = ["compilation_pipeline.h"],
+    deps = [
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Pass",
+        "@tensor_ir//:NVTensorIRCudaTilePipelines",
+        "@tensor_ir//:NVTensorIRToCudaTileConversion",
+    ],
+)
+
+cc_library(
+    name = "fusion",
+    srcs = ["fusion.cc"],
+    hdrs = ["fusion.h"],
+    visibility = [
+        "//xla/backends/gpu/codegen:__subpackages__",
+        "//xla/service/gpu:__subpackages__",
+    ],
+    deps = [
+        ":compilation_pipeline",
+        ":conversion",
+        ":support",
+        "//xla/backends/gpu/codegen:fusion_emitter",
+        "//xla/backends/gpu/codegen:kernel_compiler",
+        "//xla/backends/gpu/runtime:tensor_ir_kernel_thunk",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/codegen/emitters:kernel_arguments",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:gpu_constants",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/service/gpu:ir_emitter_context",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@cuda_tile//:CudaTileDialect",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Support",
+        "@tensor_ir//:NVTensorIRCompiler",
+        "@tensor_ir//:NVTensorIRDialect",
+        "@tensor_ir//:NVTensorIRRuntime",
+        "@tensor_ir//:NVTensorIRUtils",
+    ],
+)

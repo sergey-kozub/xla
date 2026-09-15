@@ -362,6 +362,7 @@ cc_library(
     name = "NVTensorIRRuntime",
     srcs = ["lib/Runtime/CudaTileRuntimeKernel.cpp"],
     hdrs = [
+        "include/tensor_ir/Conversion/TensorToCudaTile/Options.h",
         "include/tensor_ir/Runtime/CudaTile/CudaTileRuntimeKernel.h",
         "include/tensor_ir/Runtime/CudaTile/KernelArgLayout.h",
         "include/tensor_ir/Runtime/CudaTile/KernelLaunchHelpers.h",

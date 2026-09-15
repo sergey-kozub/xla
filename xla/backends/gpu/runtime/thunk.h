@@ -139,6 +139,7 @@ class Thunk {
     kSelectK,
     kSend,
     kSequential,
+    kTensorIrKernel,
     kTriangularSolve,
     kWhile
     // go/keep-sorted end

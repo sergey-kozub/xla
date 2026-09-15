@@ -235,6 +235,10 @@ ThunkKindProto Thunk::KindToProto(Kind kind) {
       return THUNK_KIND_SEND;
     case kSequential:
       return THUNK_KIND_SEQUENTIAL;
+    case kTensorIrKernel:
+      // TensorIR kernel thunks aren't serializable yet; see
+      // TensorIrKernelThunk::ToProto.
+      return THUNK_KIND_UNSPECIFIED;
     case kTriangularSolve:
       return THUNK_KIND_TRIANGULAR_SOLVE;
     case kWhile:
@@ -395,6 +399,7 @@ absl::StatusOr<Thunk::Kind> Thunk::KindFromProto(ThunkKindProto kind) {
     CASE(kSelectK);
     CASE(kSend);
     CASE(kSequential);
+    CASE(kTensorIrKernel);
     CASE(kTriangularSolve);
     CASE(kWhile);
     // # go/keep-sorted end
