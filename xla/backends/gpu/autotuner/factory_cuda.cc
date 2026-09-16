@@ -99,8 +99,8 @@ std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForCuda(
       debug_options, compiler, target_config));
   backends.push_back(std::make_unique<BlockLevelEmitterBackend>(
       debug_options, compiler, shape_size_fn, target_config));
-  backends.push_back(std::make_unique<TensorIrBackend>(debug_options, compiler,
-                                                        target_config));
+  // backends.push_back(std::make_unique<TensorIrBackend>(debug_options, compiler,
+  //                                                       target_config));
 
   if (!backend_allowlist.empty()) {
     backends.erase(
