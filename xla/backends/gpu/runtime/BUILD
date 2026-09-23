@@ -1741,30 +1741,6 @@ xla_test(
 )
 
 cc_library(
-    name = "tensor_ir_kernel_thunk",
-    srcs = ["tensor_ir_kernel_thunk.cc"],
-    hdrs = ["tensor_ir_kernel_thunk.h"],
-    visibility = [
-        "//xla/backends/gpu/codegen:__subpackages__",
-    ],
-    deps = [
-        ":thunk",
-        ":thunk_proto_cc",
-        "//xla/codegen/emitters:kernel_arguments",
-        "//xla/runtime:buffer_use",
-        "//xla/service:buffer_assignment",
-        "//xla/service:shaped_slice",
-        "//xla/service/gpu:buffer_allocations",
-        "//xla/stream_executor:device_address",
-        "//xla/stream_executor:stream",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@tensor_ir//:NVTensorIRRuntime",
-    ],
-)
-
-cc_library(
     name = "select_k_thunk",
     srcs = ["select_k_thunk.cc"],
     hdrs = ["select_k_thunk.h"],

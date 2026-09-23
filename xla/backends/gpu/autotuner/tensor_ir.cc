@@ -31,6 +31,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LogicalResult.h"
 #include "tensor_ir/Conversion/TensorToCudaTile/Options.h"
@@ -39,7 +40,7 @@ limitations under the License.
 #include "tensor_ir/Utils/ComputeCapability.h"
 #include "xla/backends/autotuner/backend_config.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
-#include "xla/backends/gpu/codegen/tensor_ir/conversion.h"
+#include "xla/backends/gpu/codegen/tensor_ir/hlo_to_tensor_ir.h"
 #include "xla/backends/gpu/codegen/tensor_ir/support.h"
 #include "xla/backends/gpu/codegen/tensor_ir/temp/Arch.h"
 #include "xla/backends/gpu/codegen/tensor_ir/temp/Enumerate.h"
@@ -127,17 +128,16 @@ TensorIrBackend::GetSupportedConfigs(const HloInstruction& instr) {
     return std::vector<std::unique_ptr<BackendConfig>>();
   }
   const auto* fusion = Cast<HloFusionInstruction>(&instr);
-  const HloComputation& computation =
-      *fusion->fused_instructions_computation();
+  const HloComputation& computation = *fusion->fused_instructions_computation();
 
   mlir::MLIRContext context;
   context.loadDialect<mlir::nv_tensor_ir::TensorIRDialect,
                       mlir::arith::ArithDialect>();
-  mlir::ModuleOp module =
-      mlir::ModuleOp::create(mlir::UnknownLoc::get(&context));
+  mlir::OwningOpRef<mlir::ModuleOp> module(
+      mlir::ModuleOp::create(mlir::UnknownLoc::get(&context)));
   ABSL_ASSIGN_OR_RETURN(
       mlir::nv_tensor_ir::GraphOp graph_op,
-      tensor_ir::ConvertFusionComputation(computation, module));
+      tensor_ir::ImportAndLegalizeComputation(computation, *module));
 
   // `enumerateTilings` reads the "iteration_space" attribute that the
   // layout-propagation passes attach to the graph; run them first.
@@ -146,7 +146,7 @@ TensorIrBackend::GetSupportedConfigs(const HloInstruction& instr) {
       mlir::nv_tensor_ir::createLayoutPropagationAnnotationPass());
   pass_manager.addNestedPass<mlir::nv_tensor_ir::GraphOp>(
       mlir::nv_tensor_ir::createLayoutPropagationNormalizationPass());
-  if (llvm::failed(pass_manager.run(module))) {
+  if (llvm::failed(pass_manager.run(*module))) {
     return absl::InvalidArgumentError(
         absl::StrCat("TensorIrBackend: layout propagation failed for "
                      "fusion: ",
@@ -203,7 +203,7 @@ absl::Status TensorIrBackend::ApplyConfig(HloInstruction& instr,
     return absl::InvalidArgumentError("Expected TensorIrFusionConfig.");
   }
   ABSL_ASSIGN_OR_RETURN(GpuBackendConfig gpu_backend_config,
-                   instr.backend_config<GpuBackendConfig>());
+                        instr.backend_config<GpuBackendConfig>());
   FusionBackendConfig& backend_config =
       *gpu_backend_config.mutable_fusion_backend_config();
   backend_config.set_kind(kTensorIrFusionKind);
@@ -215,6 +215,11 @@ absl::Status TensorIrBackend::ApplyConfig(HloInstruction& instr,
 
 bool TensorIrBackend::IsSupported(const HloInstruction& instr) {
   if (instr.opcode() != HloOpcode::kFusion) {
+    return false;
+  }
+  if (!tensor_ir::IsSupportedComputeCapability(
+           target_config().device_description.gpu_compute_capability())
+           .IsAllowed()) {
     return false;
   }
   const auto* fusion = Cast<HloFusionInstruction>(&instr);

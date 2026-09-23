@@ -32,7 +32,7 @@ limitations under the License.
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LLVM.h"
-#include "xla/backends/gpu/codegen/tensor_ir/conversion.h"
+#include "xla/backends/gpu/codegen/tensor_ir/hlo_to_tensor_ir.h"
 #include "xla/backends/gpu/codegen/tensor_ir/support.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -70,7 +70,7 @@ mlir::OwningOpRef<mlir::ModuleOp> HloToTensorIRTranslate(
     return nullptr;
   }
 
-  auto module_or = ConvertFusionComputation(*comp, context);
+  auto module_or = ImportAndLegalizeComputation(*comp, context);
   if (!module_or.ok()) {
     mlir::emitError(mlir::UnknownLoc::get(context))
         << module_or.status().message();

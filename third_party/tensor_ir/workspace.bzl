@@ -17,5 +17,7 @@ def repo():
             "//third_party/tensor_ir:patches/unused_variable.patch",
             "//third_party/tensor_ir:patches/symbol_op_interface.patch",
             "//third_party/tensor_ir:patches/hotfixes.patch",
+            "//third_party/tensor_ir:patches/static_grid_getter.patch",
+            "//third_party/tensor_ir:patches/tileiras_path_override.patch",
         ],
     )

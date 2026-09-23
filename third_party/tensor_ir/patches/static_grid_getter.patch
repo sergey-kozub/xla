@@ -1,0 +1,64 @@
+Expose the compile-time launch grid to ahead-of-time hosts.
+
+XLA needs the launch grid on the host to build a kernel thunk, but the only
+way to obtain it is GridSizeComputer::computeGrid, which requires a runtime
+operand accessor. For statically shaped graphs the grid is already fixed at
+compile time, so add a staticGrid() accessor that returns it directly, and
+std::nullopt when the grid genuinely depends on runtime shapes.
+
+diff --git a/include/tensor_ir/Runtime/CudaTile/CudaTileRuntimeKernel.h b/include/tensor_ir/Runtime/CudaTile/CudaTileRuntimeKernel.h
+index f370177..c649183 100644
+--- a/include/tensor_ir/Runtime/CudaTile/CudaTileRuntimeKernel.h
++++ b/include/tensor_ir/Runtime/CudaTile/CudaTileRuntimeKernel.h
+@@ -110,6 +110,16 @@ public:
+   const std::string &funcName() const { return funcName_; }
+ 
+ 
++  // XLA integration contract: exposes the launch grid when the compiler fixed
++  // it at compile time. Returns std::nullopt when the grid depends on runtime
++  // operand shapes, or when no grid computer has been set yet.
++  std::optional<::tensor_ir::rt::GridDims> staticGrid() const {
++    if (!gridComputer_) {
++      return std::nullopt;
++    }
++    return gridComputer_->staticGrid();
++  }
++
+   /// Set the argument packer strategy (static or dynamic shapes).
+   /// Must be called after construction and before first launch.
+   void setArgPacker(std::unique_ptr<RuntimeArgPacker> packer) {
+diff --git a/include/tensor_ir/Runtime/CudaTile/KernelLaunchHelpers.h b/include/tensor_ir/Runtime/CudaTile/KernelLaunchHelpers.h
+index bcd286c..c48b1bb 100644
+--- a/include/tensor_ir/Runtime/CudaTile/KernelLaunchHelpers.h
++++ b/include/tensor_ir/Runtime/CudaTile/KernelLaunchHelpers.h
+@@ -38,6 +38,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <limits>
++#include <optional>
+ 
+ namespace tensor_ir::rt {
+ 
+@@ -287,6 +288,11 @@ public:
+ 
+   /// Compute grid dimensions from runtime tensor operands.
+   virtual GridDims computeGrid(const Accessor &operands) const = 0;
++
++  /// Returns the grid dimensions when they are fixed at compile time, and
++  /// std::nullopt when they depend on runtime operand shapes. Lets an ahead-of-
++  /// time host (e.g. XLA) record the launch grid without an operand accessor.
++  virtual std::optional<GridDims> staticGrid() const { return std::nullopt; }
+ };
+ 
+ /// Returns fixed grid dimensions that were determined at compile time.
+@@ -301,6 +307,10 @@ public:
+     return {tiles_[0], tiles_[1], tiles_[2]};
+   }
+ 
++  std::optional<GridDims> staticGrid() const override {
++    return GridDims{tiles_[0], tiles_[1], tiles_[2]};
++  }
++
+ private:
+   std::array<int32_t, 3> tiles_;
+ };

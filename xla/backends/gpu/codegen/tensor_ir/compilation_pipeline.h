@@ -40,6 +40,17 @@ void CreateTensorIrPipeline(
     mlir::OpPassManager* pm,
     const mlir::nv_tensor_ir::TensorToCudaTilePipelineOptions& options);
 
+// Points TensorIR's Tile IR assembler at the `tileiras` binary staged in the
+// runfiles. TensorIR only looks on `$PATH` by default, where a Bazel-staged
+// binary never is, and quietly falls back to emitting Tile IR bytecode for the
+// driver to JIT.
+//
+// Runs the lookup once and is safe to call from several threads. Missing an
+// assembler is not an error: CUDA before 13.1 does not ship one, and the
+// bytecode fallback still produces a working kernel wherever the driver can
+// JIT it.
+void SetUpTileIrAssembler();
+
 }  // namespace xla::gpu::tensor_ir
 
 #endif  // XLA_BACKENDS_GPU_CODEGEN_TENSOR_IR_COMPILATION_PIPELINE_H_

@@ -23,6 +23,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/backend_config.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -32,6 +33,7 @@ limitations under the License.
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/platform_util.h"
+#include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/platform/statusor.h"
@@ -80,6 +82,23 @@ ENTRY %entry_computation (p0: f32[32,4096]) -> f32[32] {
   ROOT %fusion = f32[32]{0} fusion(%p0), kind=kInput, calls=%fused_reduce
 })";
 
+// Integer fusions exercise the signedness bridge: StableHLO uses signless
+// `i32`, while nv_tensor_ir requires signed `si32`.
+constexpr char kElementwiseS32FusionHlo[] = R"(
+HloModule m
+
+%fused_mul (p0: s32[32,16], p1: s32[32,16]) -> s32[32,16] {
+  %p0 = s32[32,16]{1,0} parameter(0)
+  %p1 = s32[32,16]{1,0} parameter(1)
+  ROOT %mul = s32[32,16]{1,0} multiply(%p0, %p1)
+}
+
+ENTRY %entry_computation (p0: s32[32,16], p1: s32[32,16]) -> s32[32,16] {
+  %p0 = s32[32,16]{1,0} parameter(0)
+  %p1 = s32[32,16]{1,0} parameter(1)
+  ROOT %fusion = s32[32,16]{1,0} fusion(%p0, %p1), kind=kLoop, calls=%fused_mul
+})";
+
 // `pad` isn't part of the opcode set the TensorIR emitter supports.
 constexpr char kUnsupportedOpFusionHlo[] = R"(
 HloModule m
@@ -102,7 +121,13 @@ class TensorIrBackendTest : public HloHardwareIndependentTestBase {
         stream_executor_(platform_->ExecutorForDevice(0).value()),
         target_config_(stream_executor_),
         compiler_(Compiler::GetForPlatform(platform_->id()).value()),
-        backend_(&debug_options_, compiler_.get(), &target_config_) {}
+        backend_(&debug_options_, compiler_.get(), &target_config_) {
+    // The backend only supports Hopper and newer. Pin the target so that these
+    // tests do not depend on which GPU the test machine happens to have;
+    // `IsSupportedReturnsFalseForPreHopper` covers the other side.
+    target_config_.device_description.set_cuda_compute_capability(
+        se::CudaComputeCapability::Hopper());
+  }
 
   DebugOptions debug_options_;
   se::Platform* platform_;
@@ -115,8 +140,8 @@ class TensorIrBackendTest : public HloHardwareIndependentTestBase {
 TEST_F(TensorIrBackendTest, IsSupportedReturnsTrueForSupportedFusion) {
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kElementwiseFusionHlo));
-  EXPECT_TRUE(backend_.IsSupported(
-      *module->entry_computation()->root_instruction()));
+  EXPECT_TRUE(
+      backend_.IsSupported(*module->entry_computation()->root_instruction()));
 }
 
 TEST_F(TensorIrBackendTest, IsSupportedReturnsFalseForNonFusion) {
@@ -128,24 +153,32 @@ ENTRY %entry_computation (p0: f32[4], p1: f32[4]) -> f32[4] {
   %p1 = f32[4]{0} parameter(1)
   ROOT %add = f32[4]{0} add(%p0, %p1)
 })"));
-  EXPECT_FALSE(backend_.IsSupported(
-      *module->entry_computation()->root_instruction()));
+  EXPECT_FALSE(
+      backend_.IsSupported(*module->entry_computation()->root_instruction()));
+}
+
+TEST_F(TensorIrBackendTest, IsSupportedReturnsFalseForPreHopper) {
+  target_config_.device_description.set_cuda_compute_capability(
+      se::CudaComputeCapability::Ampere());
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kElementwiseFusionHlo));
+  EXPECT_FALSE(
+      backend_.IsSupported(*module->entry_computation()->root_instruction()));
 }
 
 TEST_F(TensorIrBackendTest, IsSupportedReturnsFalseForUnsupportedOpcode) {
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kUnsupportedOpFusionHlo));
-  EXPECT_FALSE(backend_.IsSupported(
-      *module->entry_computation()->root_instruction()));
+  EXPECT_FALSE(
+      backend_.IsSupported(*module->entry_computation()->root_instruction()));
 }
 
 TEST_F(TensorIrBackendTest, GetDefaultConfigReturnsTensorIrConfig) {
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kElementwiseFusionHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<BackendConfig> config,
-      backend_.GetDefaultConfig(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
+                       backend_.GetDefaultConfig(
+                           *module->entry_computation()->root_instruction()));
 
   // GetDefaultConfig returns the top-ranked config from GetSupportedConfigs.
   ASSERT_TRUE(config->has_tensor_ir());
@@ -157,16 +190,15 @@ TEST_F(TensorIrBackendTest, GetDefaultConfigFailsForUnsupportedInstruction) {
                        ParseAndReturnVerifiedModule(kUnsupportedOpFusionHlo));
   EXPECT_THAT(backend_.GetDefaultConfig(
                   *module->entry_computation()->root_instruction()),
-             StatusIs(absl::StatusCode::kInvalidArgument));
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST_F(TensorIrBackendTest, GetSupportedConfigsReturnsRankedTilings) {
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kReductionFusionHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
 
   // SelectBestTilings caps the number of returned configs at 20.
   EXPECT_THAT(configs, Not(IsEmpty()));
@@ -177,13 +209,28 @@ TEST_F(TensorIrBackendTest, GetSupportedConfigsReturnsRankedTilings) {
   }
 }
 
+// If the signless `i32` to signed `si32` bridge regressed, legalization would
+// fail and `GetSupportedConfigs` would return an error instead of configs.
+TEST_F(TensorIrBackendTest, GetSupportedConfigsHandlesSignedIntegers) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kElementwiseS32FusionHlo));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
+
+  EXPECT_THAT(configs, Not(IsEmpty()));
+  for (const std::unique_ptr<BackendConfig>& config : configs) {
+    ASSERT_TRUE(config->has_tensor_ir());
+    EXPECT_THAT(config->tensor_ir().tile_size(), Not(IsEmpty()));
+  }
+}
+
 TEST_F(TensorIrBackendTest, GetSupportedConfigsReturnsEmptyForUnsupported) {
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kUnsupportedOpFusionHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
   EXPECT_THAT(configs, IsEmpty());
 }
 
@@ -205,9 +252,8 @@ TEST_F(TensorIrBackendTest, ApplyConfigSetsFusionBackendConfig) {
       gpu_backend_config.fusion_backend_config();
   EXPECT_EQ(backend_config.kind(), kTensorIrFusionKind);
   EXPECT_THAT(backend_config.tensor_ir_fusion_config().tile_size(),
-             testing::ElementsAre(8, 16));
-  EXPECT_EQ(backend_config.tensor_ir_fusion_config().reduction_tile_size(),
-           64);
+              testing::ElementsAre(8, 16));
+  EXPECT_EQ(backend_config.tensor_ir_fusion_config().reduction_tile_size(), 64);
   EXPECT_EQ(fusion->fusion_kind(), HloInstruction::FusionKind::kCustom);
 }
 
@@ -220,7 +266,7 @@ TEST_F(TensorIrBackendTest, ApplyConfigFailsForWrongConfigType) {
   config.mutable_gemm()->set_algorithm(1);
 
   EXPECT_THAT(backend_.ApplyConfig(*fusion, config),
-             StatusIs(absl::StatusCode::kInvalidArgument));
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 }  // namespace
