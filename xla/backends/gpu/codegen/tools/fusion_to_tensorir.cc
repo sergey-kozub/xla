@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <cstdint>
 
+#include "absl/status/statusor.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/LogicalResult.h"
@@ -34,6 +35,7 @@ limitations under the License.
 #include "tensor_ir/Compiler/CudaTile/Pipelines.h"
 #include "tensor_ir/Conversion/TensorToCudaTile/Options.h"
 #include "tensor_ir/Dialect/TensorIR.h"
+#include "xla/backends/gpu/codegen/tensor_ir/hlo_to_tensor_ir.h"
 #include "xla/backends/gpu/codegen/tensor_ir/support.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -85,10 +87,13 @@ mlir::OwningOpRef<mlir::ModuleOp> HloToTensorIRTranslate(
     return nullptr;
   }
 
-  auto module_or = ImportAndLegalizeComputation(*comp, context);
-  if (!module_or.ok()) {
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::ModuleOp::create(mlir::UnknownLoc::get(context));
+  absl::StatusOr<mlir::nv_tensor_ir::GraphOp> graph_op_or =
+      ImportAndLegalizeComputation(*comp, *module);
+  if (!graph_op_or.ok()) {
     mlir::emitError(mlir::UnknownLoc::get(context))
-        << module_or.status().message();
+        << graph_op_or.status().message();
     return nullptr;
   }
   mlir::nv_tensor_ir::GraphOp graph_op = *graph_op_or;

@@ -13,29 +13,19 @@ environment stay the default; an empty path or environment restores each.
 The environment lets a host that stages the tool also tell it where its
 companions live (tileiras reads CUDA_HOME for libnvvm and ptxas) without
 touching the host's own environment.
-
 diff --git a/include/tensor_ir/Compiler/CudaTile/TileIRAssembly.h b/include/tensor_ir/Compiler/CudaTile/TileIRAssembly.h
-index b507c82..f92a160 100644
+index 655db88..c61c5ec 100644
 --- a/include/tensor_ir/Compiler/CudaTile/TileIRAssembly.h
 +++ b/include/tensor_ir/Compiler/CudaTile/TileIRAssembly.h
-@@ -4,17 +4,27 @@
- #ifndef TENSOR_IR_COMPILER_CUDATILE_TILEIRASSEMBLY_H
- #define TENSOR_IR_COMPILER_CUDATILE_TILEIRASSEMBLY_H
+@@ -9,12 +9,23 @@
  
--#include "tensor_ir/Support/Status.h"
--#include "tensor_ir/Utils/ComputeCapability.h"
-+#include <optional>
-+#include <string>
- 
-+#include "cuda_tile/Bytecode/Common/Version.h"
  #include "llvm/ADT/ArrayRef.h"
  #include "llvm/ADT/SmallVector.h"
--
--#include "cuda_tile/Bytecode/Common/Version.h"
--#include <optional>
 +#include "llvm/ADT/StringRef.h"
-+#include "tensor_ir/Support/Status.h"
-+#include "tensor_ir/Utils/ComputeCapability.h"
+ 
+ #include "cuda_tile/Bytecode/Common/Version.h"
+ #include <optional>
++#include <string>
  
  namespace mlir::nv_tensor_ir::backend::cuda_tile {
  
@@ -49,10 +39,10 @@ index b507c82..f92a160 100644
 +                        llvm::ArrayRef<std::string> environment = {});
 +
  /// Assemble the TileIR bytecode into a cubin by invoking 'tileiras'
- /// as a subprocess for the given target and bytecode version.
- /// Returns std::nullopt when the assembler is unavailable or incompatible;
+ /// as a subprocess for the given target. `bytecodeVersion` is used only for
+ /// an optional pre-flight compatibility check; when absent, the bytecode's
 diff --git a/lib/Compiler/CudaTile/TileIRAssembly.cpp b/lib/Compiler/CudaTile/TileIRAssembly.cpp
-index dc0f582..ff91120 100644
+index 3c2f48d..269d958 100644
 --- a/lib/Compiler/CudaTile/TileIRAssembly.cpp
 +++ b/lib/Compiler/CudaTile/TileIRAssembly.cpp
 @@ -3,6 +3,14 @@
@@ -128,10 +118,10 @@ index dc0f582..ff91120 100644
  Status processError(llvm::StringRef action, const ProcessResult &result,
                      llvm::StringRef stderrPath) {
    std::string message = action.str() + " failed with exit code " +
-@@ -78,17 +104,25 @@ Status processError(llvm::StringRef action, const ProcessResult &result,
- [[maybe_unused]] StatusOr<llvm::SmallVector<char, 0>>
- assembleWithExecutable(llvm::ArrayRef<char> bytecode, SmTarget target,
-                        mlir::cuda_tile::BytecodeVersion bytecodeVersion) {
+@@ -78,9 +104,18 @@ Status processError(llvm::StringRef action, const ProcessResult &result,
+ [[maybe_unused]] StatusOr<llvm::SmallVector<char, 0>> assembleWithExecutable(
+     llvm::ArrayRef<char> bytecode, SmTarget target,
+     std::optional<mlir::cuda_tile::BytecodeVersion> bytecodeVersion) {
 -  auto program = llvm::sys::findProgramByName("tileiras");
 -  if (!program) {
 -    return Status::NotFound("tileiras was not found on PATH");
@@ -150,17 +140,20 @@ index dc0f582..ff91120 100644
    }
  
    TIR_ASSIGN_OR_RETURN(auto stdoutFile, createTemporaryFile("stdout"));
-   TIR_ASSIGN_OR_RETURN(auto stderrFile, createTemporaryFile("stderr"));
--  llvm::SmallVector<llvm::StringRef, 2> versionArgs{*program,
--                                                    "--list-versions"};
-+  llvm::SmallVector<llvm::StringRef, 2> versionArgs{program, "--list-versions"};
-   ProcessResult query =
--      runProgram(*program, versionArgs, stdoutFile.path, stderrFile.path);
-+      runProgram(program, versionArgs, env, stdoutFile.path, stderrFile.path);
-   if (query.exitCode != 0) {
-     return processError("tileiras --list-versions", query, stderrFile.path);
-   }
-@@ -121,10 +155,10 @@ assembleWithExecutable(llvm::ArrayRef<char> bytecode, SmTarget target,
+@@ -90,10 +125,10 @@ Status processError(llvm::StringRef action, const ProcessResult &result,
+   // version up front, do a cheap pre-flight check so an unsupported version
+   // fails fast with a clear message instead of via `tileiras`'s own error.
+   if (bytecodeVersion) {
+-    llvm::SmallVector<llvm::StringRef, 2> versionArgs{*program,
++    llvm::SmallVector<llvm::StringRef, 2> versionArgs{program,
+                                                       "--list-versions"};
+     ProcessResult query =
+-        runProgram(*program, versionArgs, stdoutFile.path, stderrFile.path);
++        runProgram(program, versionArgs, env, stdoutFile.path, stderrFile.path);
+     if (query.exitCode != 0) {
+       return processError("tileiras --list-versions", query, stderrFile.path);
+     }
+@@ -128,10 +163,10 @@ Status processError(llvm::StringRef action, const ProcessResult &result,
    std::string gpuArg =
        "--gpu-name=sm_" + std::to_string(target.getComputeCapabilityVersion());
    std::string outputArg = "--output-file=" + outputFile.path;
@@ -173,7 +166,7 @@ index dc0f582..ff91120 100644
    if (compile.exitCode != 0) {
      return processError("tileiras compilation", compile, stderrFile.path);
    }
-@@ -145,6 +179,14 @@ bool isUnavailable(const Status &status) {
+@@ -151,6 +186,14 @@ bool isUnavailable(const Status &status) {
  
  } // namespace
  
@@ -185,6 +178,6 @@ index dc0f582..ff91120 100644
 +                                         environment.end());
 +}
 +
- StatusOr<std::optional<llvm::SmallVector<char, 0>>>
- assembleTileIRToCubin(llvm::ArrayRef<char> bytecode, SmTarget target,
-                       mlir::cuda_tile::BytecodeVersion bytecodeVersion) {
+ StatusOr<std::optional<llvm::SmallVector<char, 0>>> assembleTileIRToCubin(
+     llvm::ArrayRef<char> bytecode, SmTarget target,
+     std::optional<mlir::cuda_tile::BytecodeVersion> bytecodeVersion) {

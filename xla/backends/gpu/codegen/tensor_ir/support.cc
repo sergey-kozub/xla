@@ -266,6 +266,21 @@ CodegenDecision IsInstructionSupportedForFusion(const HloInstruction& instr) {
       break;
     }
 
+    // HLO allows scalar `min`/`max` bounds for clamp and a scalar predicate
+    // for select, but the TensorIR ops require all operands to have the same
+    // shape.
+    case HloOpcode::kClamp:
+    case HloOpcode::kSelect: {
+      for (const HloInstruction* operand : instr.operands()) {
+        if (operand->shape().dimensions() != instr.shape().dimensions()) {
+          return CodegenDecision::Forbid(absl::StrCat(
+              "Unsupported scalar operand of ternary operation: ",
+              instr.name()));
+        }
+      }
+      break;
+    }
+
     default: {
       break;
     }

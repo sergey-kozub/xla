@@ -15,7 +15,9 @@ limitations under the License.
 
 #include "xla/backends/gpu/autotuner/tensor_ir.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -27,24 +29,23 @@ limitations under the License.
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/LogicalResult.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "llvm/Support/MathExtras.h"
+#include "mlir/Dialect/Arith/IR/ArithDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LogicalResult.h"
-#include "tensor_ir/Conversion/TensorToCudaTile/Options.h"
 #include "tensor_ir/Dialect/TensorIR.h"
 #include "tensor_ir/Transform/Passes.h"
 #include "tensor_ir/Utils/ComputeCapability.h"
-#include "xla/backends/autotuner/backend_config.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/backends/gpu/codegen/tensor_ir/hlo_to_tensor_ir.h"
 #include "xla/backends/gpu/codegen/tensor_ir/support.h"
-#include "xla/backends/gpu/codegen/tensor_ir/temp/Arch.h"
-#include "xla/backends/gpu/codegen/tensor_ir/temp/Enumerate.h"
-#include "xla/backends/gpu/codegen/tensor_ir/temp/Evaluate.h"
+#include "tensor_ir/Analysis/Tiling/Arch.h"
+#include "tensor_ir/Analysis/Tiling/Enumerate.h"
+#include "tensor_ir/Analysis/Tiling/Evaluate.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -61,60 +62,81 @@ namespace gpu {
 namespace {
 
 using ::mlir::nv_tensor_ir::tiling_analysis::TilingConfig;
+using ::mlir::nv_tensor_ir::tiling_analysis::TilingEvaluation;
 
 std::unique_ptr<BackendConfig> Pack(const TilingConfig& tiling_config) {
   auto config = std::make_unique<BackendConfig>();
   TensorIrFusionConfig* tensor_ir_config = config->mutable_tensor_ir();
-  for (int64_t dim : tiling_config.tileShape) {
-    tensor_ir_config->add_tile_size(static_cast<int32_t>(dim));
+  for (int32_t dim : tiling_config.getTileShape()) {
+    tensor_ir_config->add_tile_size(dim);
   }
-  tensor_ir_config->set_reduction_tile_size(tiling_config.reductionTileSize);
+  tensor_ir_config->set_reduction_tile_size(
+      tiling_config.getReductionTileSize());
   return config;
 }
 
 // Enumerates up to `num_tilings_to_generate` candidate tilings for `graph`
-// and returns the `num_tilings_to_select` best-scoring ones, ranked by an
-// estimated memory-pressure score (lower is better).
+// and returns the `num_tilings_to_select` best ones, ranked by the tiling
+// evaluator's cost model (best first).
 absl::StatusOr<llvm::SmallVector<TilingConfig>> SelectBestTilings(
     mlir::nv_tensor_ir::GraphOp graph, int64_t num_tilings_to_generate,
     int64_t num_tilings_to_select,
     const mlir::nv_tensor_ir::tiling_analysis::ArchInfo& arch_info) {
-  mlir::FailureOr<llvm::SmallVector<TilingConfig>> tilings =
-      mlir::nv_tensor_ir::tiling_analysis::enumerateTilings(
-          graph, num_tilings_to_generate);
-  if (llvm::failed(tilings)) {
+  mlir::FailureOr<mlir::nv_tensor_ir::tiling_analysis::TilingEvaluator>
+      evaluator = mlir::nv_tensor_ir::tiling_analysis::TilingEvaluator::create(
+          graph, arch_info);
+  if (llvm::failed(evaluator)) {
     return absl::InvalidArgumentError(
-        "TensorIrBackend: failed to enumerate tilings");
+        "TensorIrBackend: failed to create the tiling evaluator");
   }
+  llvm::SmallVector<TilingConfig> tilings =
+      mlir::nv_tensor_ir::tiling_analysis::enumerateTilings(
+          *evaluator, num_tilings_to_generate);
 
-  // Simple heuristic: minimize the memory pressure.
-  mlir::nv_tensor_ir::tiling_analysis::TilingEvaluator evaluator(arch_info);
-  auto score =
-      [](const mlir::nv_tensor_ir::tiling_analysis::TilingEvaluation& eval) {
-        return eval.blockCount *
-               (eval.memoryAccessCacheLines + eval.memoryAccessCount);
-      };
+  // Use a storage size threshold to filter out tilings that are too large.
+  constexpr int64_t kStorageSizeThreshold =
+      ::mlir::nv_tensor_ir::tiling_analysis::kMaxRegistersPerSM *
+      ::mlir::nv_tensor_ir::tiling_analysis::kRegisterSize;
 
-  // Score the tilings and keep the best ones.
-  llvm::SmallVector<std::pair<TilingConfig, int64_t>> scored;
-  scored.reserve(tilings->size());
-  for (const TilingConfig& tiling_config : *tilings) {
-    auto eval = evaluator.evaluate(graph, tiling_config);
-    if (eval.errorStatus == mlir::nv_tensor_ir::tiling_analysis::
-                                TilingEvaluation::EvalError::Success) {
-      scored.emplace_back(tiling_config, score(eval));
+  // Evaluate each tiling and keep those that fit in the register budget,
+  // grouped by the product of the tile shape. The next step spreads the
+  // selection across these groups.
+  using EvaluatedTiling = std::pair<TilingConfig, TilingEvaluation>;
+  std::map<int64_t, llvm::SmallVector<EvaluatedTiling>>
+      tilings_grouped_by_tile_size;
+  for (const TilingConfig& tiling_config : tilings) {
+    auto eval = evaluator->evaluate(tiling_config);
+    if (llvm::succeeded(eval) &&
+        eval->registerStorageBytes < kStorageSizeThreshold) {
+      int64_t tile_size =
+          llvm::product_of(tiling_config.getTileShape(), int64_t{1});
+      tilings_grouped_by_tile_size[tile_size].emplace_back(tiling_config,
+                                                           *eval);
     }
   }
-  llvm::sort(scored,
-             [](const auto& a, const auto& b) { return a.second < b.second; });
-  if (static_cast<int64_t>(scored.size()) > num_tilings_to_select) {
-    scored.resize(num_tilings_to_select);
+
+  // Pick `num_tilings_to_select` tilings spread across tile sizes. Each group
+  // is sorted by cost (best first) and takes an equal share of the remaining
+  // budget, rounded up. A group smaller than its share leaves the unused slots
+  // for later groups.
+  llvm::SmallVector<EvaluatedTiling> selected;
+  int64_t budget = num_tilings_to_select;
+  int64_t remaining_groups = tilings_grouped_by_tile_size.size();
+  for (auto &[tile_size, group] : tilings_grouped_by_tile_size) {
+    llvm::sort(group, [](const auto& a, const auto& b) {
+      return a.second < b.second;
+    });
+    int64_t take = std::min<int64_t>(
+        group.size(), llvm::divideCeil(budget, remaining_groups));
+    budget -= take;
+    --remaining_groups;
+    selected.append(group.begin(), group.begin() + take);
   }
 
   // Return the best tilings.
   llvm::SmallVector<TilingConfig> result;
-  result.reserve(scored.size());
-  for (auto& [tiling_config, unused_score] : scored) {
+  result.reserve(selected.size());
+  for (auto& [tiling_config, unused_eval] : selected) {
     result.push_back(std::move(tiling_config));
   }
   return result;
@@ -168,14 +190,16 @@ TensorIrBackend::GetSupportedConfigs(const HloInstruction& instr) {
     return absl::InvalidArgumentError(
         "TensorIrBackend: unsupported compute capability");
   }
-  const auto& arch_info = mlir::nv_tensor_ir::tiling_analysis::getArchInfo(
-      sm_target->getComputeCapability());
+  const mlir::nv_tensor_ir::tiling_analysis::ArchInfo arch_info =
+      mlir::nv_tensor_ir::tiling_analysis::getArchInfo(
+          sm_target->getComputeCapability(),
+          target_config().device_description.core_count());
 
   // Select the best tilings.
   ABSL_ASSIGN_OR_RETURN(
       llvm::SmallVector<TilingConfig> tilings,
       SelectBestTilings(graph_op, /*num_tilings_to_generate=*/1000,
-                        /*num_tilings_to_select=*/20, arch_info));
+                        /*num_tilings_to_select=*/10, arch_info));
 
   std::vector<std::unique_ptr<BackendConfig>> configs;
   configs.reserve(tilings.size());

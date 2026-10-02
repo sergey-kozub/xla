@@ -18,21 +18,21 @@ limitations under the License.
 
 #include "absl/status/statusor.h"
 #include "tensor_ir/Runtime/IRuntimeKernel.h"
-#include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
+#include "xla/service/gpu/kernel_reuse_cache.h"
 
 namespace xla::gpu::tensor_ir {
 
-// Wraps a kernel compiled by the TensorIR CudaTile backend in an XLA
-// `CustomKernel`, so that it can be launched by a `CustomKernelThunk`. Going
-// through the generic thunk rather than a bespoke one is what lets XLA
-// serialize the kernel and record it into a command buffer.
+// Extracts what is needed to launch a kernel compiled by the TensorIR CudaTile
+// backend with a `CustomKernelThunk`: the cubin, the entry point and the launch
+// grid. Going through the generic thunk rather than a bespoke one is what lets
+// XLA serialize the kernel and record it into a command buffer, and returning a
+// `KernelReuseCache::Entry` lets identical fusions share one compiled kernel.
 //
 // `kernel` must have come from a compiler created with
 // `CompilerBackend::CudaTile`, which only ever returns a
-// `CudaTileRuntimeKernel`. `num_arguments` is the number of device buffers the
-// kernel is launched with: the fusion's inputs followed by its output.
-absl::StatusOr<CustomKernel> MakeCustomKernel(
-    const ::tensor_ir::rt::IRuntimeKernel& kernel, int num_arguments);
+// `CudaTileRuntimeKernel`.
+absl::StatusOr<KernelReuseCache::Entry> MakeKernelCacheEntry(
+    const ::tensor_ir::rt::IRuntimeKernel& kernel);
 
 }  // namespace xla::gpu::tensor_ir
 

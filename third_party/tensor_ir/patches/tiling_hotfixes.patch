@@ -1,18 +1,19 @@
 diff --git a/include/tensor_ir/Compiler/CudaTile/CudaTileCompiler.h b/include/tensor_ir/Compiler/CudaTile/CudaTileCompiler.h
-index aa34233..8fd2f40 100644
+index 01eb58c..6251a9c 100644
 --- a/include/tensor_ir/Compiler/CudaTile/CudaTileCompiler.h
 +++ b/include/tensor_ir/Compiler/CudaTile/CudaTileCompiler.h
-@@ -161,6 +161,8 @@ public:
+@@ -160,6 +160,9 @@ public:
    /// TileIR bytecode.
    CudaTileArtifactKind artifactKind = CudaTileArtifactKind::TileIR;
  
 +  /// Tile size for contracting dimensions in layout-propagation lowering.
 +  int64_t reductionTileSize = 128;
- 
++
    CudaTileCompileOptions(SmTarget computeCapability_)
        : CompileOptions(computeCapability_, CompilerBackend::CudaTile) {}
+ 
 diff --git a/lib/Analysis/TileCandidateGenerator.cpp b/lib/Analysis/TileCandidateGenerator.cpp
-index bc19e56..caba8f1 100644
+index b4b7a93..a499696 100644
 --- a/lib/Analysis/TileCandidateGenerator.cpp
 +++ b/lib/Analysis/TileCandidateGenerator.cpp
 @@ -1680,7 +1680,7 @@ bool TileCandidateGenerator::isValidTile(llvm::ArrayRef<int32_t> tile,
@@ -25,10 +26,10 @@ index bc19e56..caba8f1 100644
        return false;
      }
 diff --git a/lib/Compiler/CudaTile/CudaTileCompiler.cpp b/lib/Compiler/CudaTile/CudaTileCompiler.cpp
-index 9e46e91..742cd88 100644
+index 20f60a6..f295af6 100644
 --- a/lib/Compiler/CudaTile/CudaTileCompiler.cpp
 +++ b/lib/Compiler/CudaTile/CudaTileCompiler.cpp
-@@ -125,6 +125,7 @@ CudaTileCompiler::makePipelineOptions(
+@@ -124,6 +124,7 @@ CudaTileCompiler::makePipelineOptions(
        getCodegenStrategy(cudaTileOptions.codegenStrategy);
    pipelineOptions.maxCandidates =
        getMaxTileCandidatesFromEnvOrDefault(cudaTileOptions.maxTileCandidates);
@@ -36,23 +37,3 @@ index 9e46e91..742cd88 100644
    return pipelineOptions;
  }
  
-diff --git a/lib/Conversion/TensorToCudaTile/LayoutPropagationImpl.cpp b/lib/Conversion/TensorToCudaTile/LayoutPropagationImpl.cpp
-index 56bcabb..761d601 100644
---- a/lib/Conversion/TensorToCudaTile/LayoutPropagationImpl.cpp
-+++ b/lib/Conversion/TensorToCudaTile/LayoutPropagationImpl.cpp
-@@ -1006,8 +1006,14 @@ LogicalResult ConversionStateImpl::start(GraphOp graphOp) {
-   layouts.clear();
-   operandIndex = 0;
- 
-+  // Applying folding before patterns may break the operand order for the ops
-+  // with `Commutative` trait. The operands and layouts must have the same
-+  // order during the conversion.
-+  ConversionConfig config;
-+  config.foldingMode = DialectConversionFoldingMode::AfterPatterns;
-+
-   // Start the conversion for the current graph.
--  return applyFullConversion(graphOp, conversionTarget, patterns);
-+  return applyFullConversion(graphOp, conversionTarget, patterns, config);
- }
- 
- /// Prepare the conversion state for an operation conversion.

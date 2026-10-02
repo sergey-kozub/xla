@@ -5,14 +5,13 @@ way to obtain it is GridSizeComputer::computeGrid, which requires a runtime
 operand accessor. For statically shaped graphs the grid is already fixed at
 compile time, so add a staticGrid() accessor that returns it directly, and
 std::nullopt when the grid genuinely depends on runtime shapes.
-
 diff --git a/include/tensor_ir/Runtime/CudaTile/CudaTileRuntimeKernel.h b/include/tensor_ir/Runtime/CudaTile/CudaTileRuntimeKernel.h
-index f370177..c649183 100644
+index aab354c..e0bc322 100644
 --- a/include/tensor_ir/Runtime/CudaTile/CudaTileRuntimeKernel.h
 +++ b/include/tensor_ir/Runtime/CudaTile/CudaTileRuntimeKernel.h
-@@ -110,6 +110,16 @@ public:
-   const std::string &funcName() const { return funcName_; }
+@@ -116,6 +116,16 @@ public:
  
+   const TensorIRArtifact &getArtifact() const { return *artifact_; }
  
 +  // XLA integration contract: exposes the launch grid when the compiler fixed
 +  // it at compile time. Returns std::nullopt when the grid depends on runtime
@@ -24,14 +23,14 @@ index f370177..c649183 100644
 +    return gridComputer_->staticGrid();
 +  }
 +
-   /// Set the argument packer strategy (static or dynamic shapes).
-   /// Must be called after construction and before first launch.
-   void setArgPacker(std::unique_ptr<RuntimeArgPacker> packer) {
+ private:
+   explicit CudaTileRuntimeKernel(
+       std::unique_ptr<const TensorIRArtifact> artifact)
 diff --git a/include/tensor_ir/Runtime/CudaTile/KernelLaunchHelpers.h b/include/tensor_ir/Runtime/CudaTile/KernelLaunchHelpers.h
-index bcd286c..c48b1bb 100644
+index 5a98350..bc7dce8 100644
 --- a/include/tensor_ir/Runtime/CudaTile/KernelLaunchHelpers.h
 +++ b/include/tensor_ir/Runtime/CudaTile/KernelLaunchHelpers.h
-@@ -38,6 +38,7 @@
+@@ -40,6 +40,7 @@
  #include <cstdint>
  #include <cstring>
  #include <limits>
@@ -39,7 +38,7 @@ index bcd286c..c48b1bb 100644
  
  namespace tensor_ir::rt {
  
-@@ -287,6 +288,11 @@ public:
+@@ -309,6 +310,11 @@ public:
  
    /// Compute grid dimensions from runtime tensor operands.
    virtual GridDims computeGrid(const Accessor &operands) const = 0;
@@ -51,7 +50,7 @@ index bcd286c..c48b1bb 100644
  };
  
  /// Returns fixed grid dimensions that were determined at compile time.
-@@ -301,6 +307,10 @@ public:
+@@ -323,6 +329,10 @@ public:
      return {tiles_[0], tiles_[1], tiles_[2]};
    }
  

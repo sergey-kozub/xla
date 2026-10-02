@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/tensor_ir/custom_kernel.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -25,21 +26,26 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/Support/Casting.h"
 #include "tensor_ir/Runtime/CudaTile/CudaTileRuntimeKernel.h"
 #include "tensor_ir/Runtime/IRuntimeKernel.h"
-#include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
-#include "xla/backends/gpu/codegen/kernels/ptx_custom_kernel.h"
+#include "xla/service/gpu/kernel_reuse_cache.h"
+#include "xla/service/gpu/launch_dimensions.h"
 #include "xla/stream_executor/launch_dim.h"
 
 namespace xla::gpu::tensor_ir {
 
-absl::StatusOr<CustomKernel> MakeCustomKernel(
-    const ::tensor_ir::rt::IRuntimeKernel& kernel, int num_arguments) {
-  // The CudaTile backend only ever returns a `CudaTileRuntimeKernel`, and
-  // `IRuntimeKernel` has no LLVM-style RTTI hook, so downcast the same way the
-  // vendored compiler downcasts its own result.
-  const auto& cuda_tile_kernel =
-      static_cast<const ::tensor_ir::rt::CudaTileRuntimeKernel&>(kernel);
+absl::StatusOr<KernelReuseCache::Entry> MakeKernelCacheEntry(
+    const ::tensor_ir::rt::IRuntimeKernel& kernel) {
+  const auto* cuda_tile_kernel_ptr =
+      llvm::dyn_cast<::tensor_ir::rt::CudaTileRuntimeKernel>(&kernel);
+  if (cuda_tile_kernel_ptr == nullptr) {
+    return absl::InternalError(
+        absl::StrCat("TensorIR kernel '", kernel.name(),
+                     "' is not a CudaTile runtime kernel"));
+  }
+  const ::tensor_ir::rt::CudaTileRuntimeKernel& cuda_tile_kernel =
+      *cuda_tile_kernel_ptr;
 
   if (!cuda_tile_kernel.hasDeviceCode()) {
     return absl::InternalError(absl::StrCat(
@@ -73,18 +79,21 @@ absl::StatusOr<CustomKernel> MakeCustomKernel(
   // CudaTile's launch ABI, from `CudaTileRuntimeKernel::launch`: one thread per
   // block, no shared memory, and -- since XLA only produces static shapes, for
   // which the compiler installs a `PointerOnlyArgPacker` -- one device pointer
-  // per argument, in order. That is exactly what `CreateOwnedCubinCustomKernel`
+  // per argument, in order. That is exactly what `CreateSharedCubinCustomKernel`
   // builds.
   //
   // The one thing lost is the `CU_CLUSTER_SCHEDULING_POLICY_SPREAD` launch
   // attribute that `launch` sets. It is a scheduling hint for thread block
   // clusters, and these kernels are launched without a cluster dimension.
   llvm::ArrayRef<char> device_code = cuda_tile_kernel.deviceCode();
-  return kernel::CreateOwnedCubinCustomKernel(
-      cuda_tile_kernel.funcName(),
-      std::vector<uint8_t>(device_code.begin(), device_code.end()),
-      num_arguments, se::BlockDim(grid->x, grid->y, grid->z),
-      se::ThreadDim(1, 1, 1), /*shared_memory_bytes=*/0);
+  KernelReuseCache::Entry entry;
+  entry.kernel_name = cuda_tile_kernel.funcName();
+  entry.launch_dimensions = LaunchDimensions(
+      se::BlockDim(grid->x, grid->y, grid->z), se::ThreadDim(1, 1, 1));
+  entry.shmem_bytes = 0;
+  entry.binary = std::make_shared<const std::vector<uint8_t>>(
+      device_code.begin(), device_code.end());
+  return entry;
 }
 
 }  // namespace xla::gpu::tensor_ir

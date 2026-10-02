@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/LogicalResult.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -44,6 +45,7 @@ limitations under the License.
 #include "tensor_ir/Utils/ComputeCapability.h"
 #include "xla/backends/gpu/codegen/kernel_compiler.h"
 #include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
+#include "xla/backends/gpu/codegen/kernels/ptx_custom_kernel.h"
 #include "xla/backends/gpu/codegen/tensor_ir/compilation_pipeline.h"
 #include "xla/backends/gpu/codegen/tensor_ir/custom_kernel.h"
 #include "xla/backends/gpu/codegen/tensor_ir/hlo_to_tensor_ir.h"
@@ -53,48 +55,25 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/hlo/ir/hlo_computation.h"
+#include "xla/future.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/mlir/utils/error_util.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/ir_emitter_context.h"
+#include "xla/service/gpu/kernel_reuse_cache.h"
 
 namespace xla::gpu {
 
-AsyncThunkSequence TensorIrFusion::Emit(
-    IrEmitterContext& ir_emitter_context,
-    const HloFusionInstruction& fusion) const {
-  // Verify the fusion is supported.
-  ABSL_ASSIGN_OR_RETURN(GpuBackendConfig gpu_backend_config,
-                        fusion.backend_config<GpuBackendConfig>());
-  const FusionBackendConfig& backend_config =
-      gpu_backend_config.fusion_backend_config();
-  if (backend_config.kind() != kTensorIrFusionKind) {
-    return absl::InternalError(absl::StrCat(
-        "TensorIrFusion: unsupported fusion kind: ", backend_config.kind()));
-  }
-  if (!backend_config.has_tensor_ir_fusion_config()) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "TensorIrFusion: missing tensor_ir_fusion_config for fusion: ",
-        fusion.ToString()));
-  }
-  const TensorIrFusionConfig& tensor_ir_config =
-      backend_config.tensor_ir_fusion_config();
+namespace {
 
-  if (auto decision = tensor_ir::IsSupportedComputeCapability(
-          ir_emitter_context.gpu_device_info().gpu_compute_capability());
-      !decision.IsAllowed()) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("TensorIrFusion: ", decision.Explain()));
-  }
-
+// Imports, lowers and compiles the fusion to a cubin.
+absl::StatusOr<KernelReuseCache::Entry> CompileFusion(
+    IrEmitterContext& ir_emitter_context, const HloFusionInstruction& fusion,
+    const TensorIrFusionConfig& tensor_ir_config,
+    const emitters::KernelArguments& kernel_arguments) {
   const HloComputation* computation = fusion.fused_instructions_computation();
-  if (auto decision = tensor_ir::IsSupportedFusionComputation(*computation);
-      !decision.IsAllowed()) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("TensorIrFusion: ", decision.Explain()));
-  }
 
   // Create the MLIR context and module.
   BorrowedMlirContext borrowed_context = ir_emitter_context.BorrowMlirContext();
@@ -120,12 +99,6 @@ AsyncThunkSequence TensorIrFusion::Emit(
     }
   }
 
-  // Attach the buffer alignments. Strides were already attached during import,
-  // but alignments come from buffer assignment and so are only available here.
-  ABSL_ASSIGN_OR_RETURN(
-      emitters::KernelArguments kernel_arguments,
-      emitters::KernelArguments::Create(ir_emitter_context.buffer_assignment(),
-                                        GetDefaultBufferAlignment(), &fusion));
   const std::vector<emitters::KernelArgument>& kernel_args =
       kernel_arguments.args();
   // The graph has one argument per fused parameter, which the HLO verifier
@@ -135,8 +108,9 @@ AsyncThunkSequence TensorIrFusion::Emit(
   int64_t num_inputs = computation->num_parameters();
   if (kernel_args.size() != num_inputs + 1) {
     return absl::InternalError(absl::StrCat(
-        "TensorIrFusion: expected a single output buffer for fusion: ",
-        fusion.ToString()));
+        "TensorIrFusion: expected ", num_inputs + 1,
+        " kernel arguments (one per fused parameter plus a single output), "
+        "got ", kernel_args.size(), " for fusion: ", fusion.ToString()));
   }
   // Layout strides were already attached by `ImportAndLegalizeComputation`;
   // alignments need buffer assignment and so can only be added here.
@@ -200,7 +174,11 @@ AsyncThunkSequence TensorIrFusion::Emit(
   // only grants from sm_90 on; below that it silently clamps the portability
   // down and `CudaTileCompileOptions::validate()` then rejects the request.
   // `IsSupportedComputeCapability` above has already ruled those out.
-  CHECK(sm_target->getPortability() == ArchPortability::arch_conditional);
+  if (sm_target->getPortability() != ArchPortability::arch_conditional) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("TensorIrFusion: unsupported compute capability: ",
+                     pipeline_options.computeCapability));
+  }
   compile_options.artifactKind = CudaTileArtifactKind::Cubin;
   // `ICompiler::compile()` rebuilds the pipeline options from the compile
   // options (`makePipelineOptions`), so the reduction tile size has to travel
@@ -219,16 +197,82 @@ AsyncThunkSequence TensorIrFusion::Emit(
                      ": ", kernel_or.status().message()));
   }
 
-  ABSL_ASSIGN_OR_RETURN(
-      CustomKernel custom_kernel,
-      tensor_ir::MakeCustomKernel(*kernel_or.value(), kernel_args.size()));
+  return tensor_ir::MakeKernelCacheEntry(**kernel_or);
+}
 
-  ThunkSequence thunks;
-  thunks.push_back(std::make_unique<CustomKernelThunk>(
-      Thunk::ThunkInfo::WithProfileAnnotation(
-          &fusion, ir_emitter_context.GetNextThunkId()),
-      std::move(custom_kernel), kernel_arguments));
-  return std::move(thunks);
+}  // namespace
+
+AsyncThunkSequence TensorIrFusion::Emit(
+    IrEmitterContext& ir_emitter_context,
+    const HloFusionInstruction& fusion) const {
+  // Verify the fusion is supported.
+  ABSL_ASSIGN_OR_RETURN(GpuBackendConfig gpu_backend_config,
+                        fusion.backend_config<GpuBackendConfig>());
+  const FusionBackendConfig& backend_config =
+      gpu_backend_config.fusion_backend_config();
+  if (backend_config.kind() != kTensorIrFusionKind) {
+    return absl::InternalError(absl::StrCat(
+        "TensorIrFusion: unsupported fusion kind: ", backend_config.kind()));
+  }
+  if (!backend_config.has_tensor_ir_fusion_config()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "TensorIrFusion: missing tensor_ir_fusion_config for fusion: ",
+        fusion.ToString()));
+  }
+  const TensorIrFusionConfig& tensor_ir_config =
+      backend_config.tensor_ir_fusion_config();
+
+  if (auto decision = tensor_ir::IsSupportedComputeCapability(
+          ir_emitter_context.gpu_device_info().gpu_compute_capability());
+      !decision.IsAllowed()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("TensorIrFusion: ", decision.Explain()));
+  }
+
+  const HloComputation* computation = fusion.fused_instructions_computation();
+  if (auto decision = tensor_ir::IsSupportedFusionComputation(*computation);
+      !decision.IsAllowed()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("TensorIrFusion: ", decision.Explain()));
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      emitters::KernelArguments kernel_arguments,
+      emitters::KernelArguments::Create(ir_emitter_context.buffer_assignment(),
+                                        GetDefaultBufferAlignment(), &fusion));
+
+  // Kernels are shared between identical fusions; the tiling is part of the
+  // key because the same computation can be compiled with different tilings.
+  std::string discriminator =
+      absl::StrCat("TensorIrFusion:", absl::StrJoin(
+                                          tensor_ir_config.tile_size(), ","),
+                   ":", tensor_ir_config.reduction_tile_size());
+  auto [future_entry, cached] = ir_emitter_context.kernel_cache().GetWithStatus(
+      computation, kernel_arguments.args(), discriminator,
+      [&]() -> xla::Future<KernelReuseCache::Entry> {
+        return CompileFusion(ir_emitter_context, fusion, tensor_ir_config,
+                             kernel_arguments);
+      });
+  Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
+      &fusion, ir_emitter_context.GetNextThunkId());
+  return future_entry.Map(
+      [&fusion, thunk_info = std::move(thunk_info),
+       kernel_arguments = std::move(kernel_arguments),
+       cached = cached](const KernelReuseCache::Entry& entry) mutable
+          -> absl::StatusOr<ThunkSequence> {
+        if (cached) {
+          VLOG(3) << "Reuse: " << fusion.name() << " -> " << entry.kernel_name;
+        }
+        ABSL_ASSIGN_OR_RETURN(
+            CustomKernel custom_kernel,
+            kernel::CreateSharedCubinCustomKernel(
+                entry.kernel_name, entry.binary, kernel_arguments.args().size(),
+                entry.launch_dimensions.block_counts(),
+                entry.launch_dimensions.thread_counts_per_block(),
+                entry.shmem_bytes));
+        return ThunkSequence::Of<CustomKernelThunk>(
+            thunk_info, std::move(custom_kernel), kernel_arguments);
+      });
 }
 
 }  // namespace xla::gpu

@@ -160,7 +160,7 @@ cc_library(
         "//xla/backends/autotuner:codegen_backend",
         "//xla/backends/gpu/codegen/tensor_ir:hlo_to_tensor_ir",
         "//xla/backends/gpu/codegen/tensor_ir:support",
-        "//xla/backends/gpu/codegen/tensor_ir/temp:tiling_analysis",
+        "@tensor_ir//:NVTensorIRTilingAnalysis",
         "//xla/hlo/ir:hlo",
         "//xla/service:compiler",
         "//xla/service/gpu:backend_configs_cc",
