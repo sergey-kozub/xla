@@ -28,6 +28,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/str_replace.h"
 #include "absl/types/span.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -78,32 +79,6 @@ namespace tir = ::mlir::nv_tensor_ir;
 absl::StatusOr<mlir::Value> ConvertReductionInstruction(
     const HloInstruction& source, mlir::ValueRange operands,
     mlir::Block& target);
-
-// Creates MLIR location from HLO instruction metadata.
-mlir::Location GetLocationFromInstruction(const HloInstruction& source,
-                                          mlir::MLIRContext* context) {
-  const OpMetadata& metadata = source.metadata();
-
-  llvm::SmallVector<mlir::Location> locations;
-  if (!metadata.op_name().empty()) {
-    locations.push_back(
-        mlir::NameLoc::get(mlir::StringAttr::get(context, metadata.op_name())));
-  }
-  if (!metadata.source_file().empty()) {
-    locations.push_back(mlir::FileLineColRange::get(
-        context, metadata.source_file(), metadata.source_line(),
-        metadata.source_column(), metadata.source_end_line(),
-        metadata.source_end_column()));
-  }
-
-  if (locations.empty()) {
-    return mlir::UnknownLoc::get(context);
-  }
-  if (locations.size() == 1) {
-    return locations.front();
-  }
-  return mlir::FusedLoc::get(context, locations);
-}
 
 // Creates MLIR type from HLO primitive type.
 absl::StatusOr<mlir::Type> GetElementType(PrimitiveType type,
@@ -706,7 +681,7 @@ absl::StatusOr<mlir::Value> ConvertFusionInstruction(
   mlir::MLIRContext* context = target.getParent()->getContext();
   VLOG(3) << "Converting HLO instruction: " << source.ToString();
 
-  mlir::Location location = GetLocationFromInstruction(source, context);
+  mlir::Location location = mlir::UnknownLoc::get(context);
   mlir::ImplicitLocOpBuilder builder(location, context);
   builder.setInsertionPointToEnd(&target);
 
@@ -867,7 +842,7 @@ absl::StatusOr<mlir::Value> ConvertReductionInstruction(
   mlir::MLIRContext* context = target.getParent()->getContext();
   VLOG(3) << "Converting HLO instruction: " << source.ToString();
 
-  mlir::Location location = GetLocationFromInstruction(source, context);
+  mlir::Location location = mlir::UnknownLoc::get(context);
   mlir::ImplicitLocOpBuilder builder(location, context);
   builder.setInsertionPointToEnd(&target);
 
@@ -991,7 +966,8 @@ absl::StatusOr<mlir::nv_tensor_ir::GraphOp> ConvertFusionComputation(
       mlir::FunctionType::get(context, input_types, output_types);
   VLOG(3) << "Function type: " << llvm_ir::DumpToString(function_type);
 
-  auto graph_op = tir::GraphOp::create(builder, source.name(),
+  auto sanitized_name = absl::StrReplaceAll(source.name(), {{".", "_"}});
+  auto graph_op = tir::GraphOp::create(builder, sanitized_name,
                                        /*sym_visibility=*/nullptr,
                                        function_type, arg_attrs, res_attrs);
 

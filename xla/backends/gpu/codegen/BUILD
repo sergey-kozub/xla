@@ -230,6 +230,7 @@ cc_library(
         "//xla/backends/gpu/codegen/emitters:reduction",
         "//xla/backends/gpu/codegen/emitters:scatter",
         "//xla/backends/gpu/codegen/emitters:transpose",
+        "//xla/backends/gpu/codegen/tensor_ir:fusion",
         "//xla/backends/gpu/codegen/triton:fusion",
         "//xla/codegen:ir_emission_utils",
         "//xla/hlo/ir:hlo",

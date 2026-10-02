@@ -96,7 +96,7 @@ xla_cc_binary(
     ],
     visibility = [":codegen_tests"],
     deps = [
-        "//xla/backends/gpu/codegen/tensor_ir:conversion",
+        "//xla/backends/gpu/codegen/tensor_ir:hlo_to_tensor_ir",
         "//xla/backends/gpu/codegen/tensor_ir:support",
         "//xla/hlo/ir:hlo",
         "//xla/tools:hlo_module_loader",
