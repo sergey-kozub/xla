@@ -101,16 +101,19 @@ absl::StatusOr<KernelReuseCache::Entry> CompileFusion(
 
   const std::vector<emitters::KernelArgument>& kernel_args =
       kernel_arguments.args();
-  // The graph has one argument per fused parameter, which the HLO verifier
-  // ties to the fusion's operands. A fusion is permitted to have operands that
-  // no fused parameter reads, though, in which case the counts disagree; fail
-  // loudly here rather than letting the alignments be attached off-by-one.
+  // The graph has one argument per fused parameter and one result per fusion
+  // output, which the HLO verifier ties to the fusion's operands and result. A
+  // fusion is permitted to have operands that no fused parameter reads, though,
+  // in which case the counts disagree; fail loudly here rather than letting the
+  // alignments be attached off-by-one.
   int64_t num_inputs = computation->num_parameters();
-  if (kernel_args.size() != num_inputs + 1) {
+  int64_t num_outputs = graph_op.getNumResults();
+  if (kernel_args.size() != num_inputs + num_outputs) {
     return absl::InternalError(absl::StrCat(
-        "TensorIrFusion: expected ", num_inputs + 1,
-        " kernel arguments (one per fused parameter plus a single output), "
-        "got ", kernel_args.size(), " for fusion: ", fusion.ToString()));
+        "TensorIrFusion: expected ", num_inputs + num_outputs,
+        " kernel arguments (one per fused parameter plus one per output), "
+        "got ",
+        kernel_args.size(), " for fusion: ", fusion.ToString()));
   }
   // Layout strides were already attached by `ImportAndLegalizeComputation`;
   // alignments need buffer assignment and so can only be added here.
@@ -257,9 +260,11 @@ AsyncThunkSequence TensorIrFusion::Emit(
       &fusion, ir_emitter_context.GetNextThunkId());
   return future_entry.Map(
       [&fusion, thunk_info = std::move(thunk_info),
-       kernel_arguments = std::move(kernel_arguments),
-       cached = cached](const KernelReuseCache::Entry& entry) mutable
-          -> absl::StatusOr<ThunkSequence> {
+       kernel_arguments = std::move(kernel_arguments), cached = cached,
+       devices_in_process =
+           ir_emitter_context.gpu_topology().num_devices_per_process()](
+          const KernelReuseCache::Entry& entry) mutable
+      -> absl::StatusOr<ThunkSequence> {
         if (cached) {
           VLOG(3) << "Reuse: " << fusion.name() << " -> " << entry.kernel_name;
         }
@@ -271,7 +276,8 @@ AsyncThunkSequence TensorIrFusion::Emit(
                 entry.launch_dimensions.thread_counts_per_block(),
                 entry.shmem_bytes));
         return ThunkSequence::Of<CustomKernelThunk>(
-            thunk_info, std::move(custom_kernel), kernel_arguments);
+            thunk_info, std::move(custom_kernel), kernel_arguments,
+            devices_in_process);
       });
 }
 
